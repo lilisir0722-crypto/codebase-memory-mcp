@@ -267,6 +267,9 @@ static int handle_subcommand(int argc, char **argv) {
         if (strcmp(argv[i], "--profile") == 0) {
             cbm_profile_enable();
         }
+        if (strcmp(argv[i], "--no-clangd") == 0) {
+            setenv("CBM_NO_CLANGD", "1", 1);
+        }
     }
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {

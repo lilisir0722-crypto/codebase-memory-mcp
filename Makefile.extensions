@@ -1,0 +1,18 @@
+# Makefile.extensions — Extension passes for codebase-memory-mcp
+#
+# This file is NOT committed upstream. Included via -include in
+# Makefile.cbm (silent no-op when absent).
+
+# ── Extension source files ───────────────────────────────────────
+EXT_SRCS += src/extensions/ext_bidir.c
+EXT_SRCS += src/extensions/ext_lsp_client.c
+EXT_SRCS += src/extensions/ext_clangd.c
+
+# ── Extension test files ─────────────────────────────────────────
+EXT_TEST_SRCS += tests/test_bidir.c
+EXT_TEST_SRCS += tests/test_lsp_client.c
+EXT_TEST_SRCS += tests/test_clangd.c
+
+# ── Wire into build ─────────────────────────────────────────────
+PIPELINE_SRCS += $(EXT_SRCS)
+ALL_TEST_SRCS += $(EXT_TEST_SRCS)
