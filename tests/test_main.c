@@ -9,6 +9,7 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "pipeline/pipeline_hooks.h"
 #include <sqlite3.h>
 
 /* Forward declarations of suite functions */
@@ -69,6 +70,7 @@ extern void suite_integration(void);
 extern void suite_incremental(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
+extern void suite_hooks(void);
 
 int main(void) {
     printf("\n  codebase-memory-mcp  C test suite\n");
@@ -183,6 +185,12 @@ int main(void) {
     /* Integration (end-to-end) */
     RUN_SUITE(integration);
     RUN_SUITE(incremental);
+
+    /* Pipeline hooks framework */
+    RUN_SUITE(hooks);
+
+    /* Extension test suites (self-registered via constructors) */
+    cbm_ext_tests_run();
 
     /* Release sqlite3 internal caches so ASan doesn't report them as leaks */
     sqlite3_shutdown();

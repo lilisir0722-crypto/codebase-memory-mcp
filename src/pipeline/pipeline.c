@@ -18,6 +18,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/pipeline_hooks.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
@@ -524,6 +525,10 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         if (check_cancel(p)) {
             rc = CBM_NOT_FOUND;
         }
+        if (rc == 0 && strcmp(seq_passes[si].name, "lsp_cross") == 0) {
+            (void)cbm_pipeline_hooks_run(CBM_HOOK_AFTER_LSP_CROSS, ctx, files,
+                                         file_count, seq_cache);
+        }
     }
     if (seq_cache) {
         for (int i = 0; i < file_count; i++) {
@@ -579,6 +584,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     (void)cbm_pipeline_pass_lsp_cross(ctx, files, file_count, cache);
     cbm_log_info("pass.timing", "pass", "lsp_cross", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
+    (void)cbm_pipeline_hooks_run(CBM_HOOK_AFTER_LSP_CROSS, ctx, files, file_count, cache);
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
@@ -794,6 +800,8 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (rc != 0) {
         return rc;
     }
+
+    cbm_pipeline_pass_param_reads(ctx, files, file_count, p->userconfig);
 
     CBM_PROF_START(t_predump);
     run_predump_passes(p, ctx);
