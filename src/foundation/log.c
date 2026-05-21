@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 static CBMLogLevel g_log_level = CBM_LOG_INFO;
 static cbm_log_sink_fn g_log_sink = NULL;
@@ -43,10 +44,17 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
         return;
     }
 
+    /* Timestamp prefix: 2026-05-21T06:42:23 */
+    char time_buf[32];
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+
     /* Build the log line into a buffer ONCE — no double va_list iteration */
     char line_buf[CBM_SZ_512];
     int pos =
-        snprintf(line_buf, sizeof(line_buf), "level=%s msg=%s", level_str(level), msg ? msg : "");
+        snprintf(line_buf, sizeof(line_buf), "time=%s level=%s msg=%s", time_buf, level_str(level), msg ? msg : "");
 
     va_list args;
     va_start(args, msg);
@@ -79,8 +87,14 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
         return;
     }
 
+    char time_buf[32];
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+
     char line_buf[CBM_SZ_256];
-    snprintf(line_buf, sizeof(line_buf), "level=%s msg=%s %s=%" PRId64, level_str(level),
+    snprintf(line_buf, sizeof(line_buf), "time=%s level=%s msg=%s %s=%" PRId64, time_buf, level_str(level),
              msg ? msg : "", key ? key : "?", value);
 
     if (g_log_sink) {

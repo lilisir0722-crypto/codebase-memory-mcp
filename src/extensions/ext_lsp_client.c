@@ -58,15 +58,19 @@ int cbm_lsp_read_response(cbm_bidir_t *proc, char **json_out, int timeout_ms) {
         }
     }
 
-    /* Parse Content-Length from headers */
+    /* Parse Content-Length from headers (non-destructive: use length-delimited scan) */
     char *line = hdr_buf;
-    while (line && *line) {
+    while (line && line < hdr_buf + hdr_pos) {
         char *eol = strstr(line, "\r\n");
-        if (eol) *eol = '\0';
-        if (content_length < 0) {
-            content_length = cbm_lsp_parse_content_length(line, strlen(line));
-        }
         if (!eol) break;
+        size_t line_len = (size_t)(eol - line);
+        if (content_length < 0 && line_len >= 16) {
+            /* Temporarily null-terminate for parsing */
+            char saved = *eol;
+            *eol = '\0';
+            content_length = cbm_lsp_parse_content_length(line, line_len);
+            *eol = saved;
+        }
         line = eol + 2;
     }
 
@@ -177,6 +181,13 @@ int cbm_lsp_client_request(cbm_lsp_client_t *c, const char *method,
         yyjson_val *rid = yyjson_obj_get(rroot, "id");
 
         if (rid && yyjson_get_int(rid) == id) {
+            /* Check for LSP error response */
+            yyjson_val *err = yyjson_obj_get(rroot, "error");
+            if (err && yyjson_is_obj(err)) {
+                yyjson_val *emsg = yyjson_obj_get(err, "message");
+                const char *estr = emsg ? yyjson_get_str(emsg) : "unknown";
+                cbm_log_warn("lsp.request.error", "method", method, "error", estr ? estr : "?");
+            }
             yyjson_doc_free(rdoc);
             *response = resp_json;
             return 0;
@@ -212,7 +223,7 @@ cbm_lsp_client_t *cbm_lsp_client_new(cbm_lsp_client_opts_t *opts) {
     const char *argv[] = {
         opts->clangd_path,
         "--header-insertion=never",
-        "--background-index=false",
+        "--background-index=true",
         NULL
     };
 

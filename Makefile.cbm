@@ -63,7 +63,7 @@ CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
-CFLAGS_TEST = $(CFLAGS_COMMON) -g -O1 $(SANITIZE)
+CFLAGS_TEST = $(CFLAGS_COMMON) -g -O1 $(SANITIZE) -DCBM_TESTING
 CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
 
 # TSan (can't combine with ASan)
