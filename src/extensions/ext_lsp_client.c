@@ -187,6 +187,10 @@ int cbm_lsp_client_request(cbm_lsp_client_t *c, const char *method,
                 yyjson_val *emsg = yyjson_obj_get(err, "message");
                 const char *estr = emsg ? yyjson_get_str(emsg) : "unknown";
                 cbm_log_warn("lsp.request.error", "method", method, "error", estr ? estr : "?");
+                yyjson_doc_free(rdoc);
+                free(resp_json);
+                *response = NULL;
+                return -1;
             }
             yyjson_doc_free(rdoc);
             *response = resp_json;
