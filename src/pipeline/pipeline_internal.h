@@ -12,6 +12,7 @@
 #include "pipeline/path_alias.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
 #include <stdatomic.h>
@@ -432,6 +433,14 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
 /* Pre-dump pass: SEMANTICALLY_RELATED edges via algorithmic embeddings.
  * Opt-in: only runs when CBM_SEMANTIC_ENABLED=1. */
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
+
+/* Post-extraction pass: PARAM_READ edges from .codebase-memory.json whitelist.
+ * Scans indexed files for occurrences of whitelisted field names and links
+ * each occurrence to its enclosing Function/Method node. No-op when
+ * ucfg is NULL or param_whitelist_count is 0. */
+int cbm_pipeline_pass_param_reads(cbm_pipeline_ctx_t *ctx,
+                                   const cbm_file_info_t *files, int file_count,
+                                   const cbm_userconfig_t *ucfg);
 
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 

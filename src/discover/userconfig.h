@@ -29,6 +29,12 @@ typedef struct {
 typedef struct {
     cbm_userext_t *entries; /* heap-allocated array */
     int count;              /* number of entries */
+
+    /* param_whitelist: field names to track via PARAM_READ edges.
+     * Loaded from "param_whitelist" array in .codebase-memory.json.
+     * Each entry is a heap-owned string. NULL when not configured. */
+    char **param_whitelist;
+    int param_whitelist_count;
 } cbm_userconfig_t;
 
 /* ── API ────────────────────────────────────────────────────────── */

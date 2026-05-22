@@ -53,6 +53,30 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <setjmp.h>
+#include <signal.h>
+
+/* Per-thread crash recovery for cbm_extract_file().
+ * If a file triggers SIGSEGV/SIGBUS during AST extraction, we skip it
+ * and continue processing the remaining files instead of crashing. */
+static _Thread_local volatile sig_atomic_t g_in_extract = 0;
+static _Thread_local sigjmp_buf g_extract_jmp;
+
+static void extract_signal_handler(int sig) {
+    (void)sig;
+    if (g_in_extract) {
+        siglongjmp(g_extract_jmp, 1);
+    }
+}
+
+static void install_extract_signal_handlers(void) {
+    struct sigaction sa;
+    sa.sa_handler = extract_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND; /* auto-restore after jump */
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
 
 static uint64_t extract_now_ns(void) {
     struct timespec ts;
@@ -483,8 +507,33 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        CBMFileResult *result = cbm_extract_file(source, source_len, fi->language, ec->project_name,
-                                                 fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+        // Skip files larger than 512 KB — Tree-Sitter AST parsing on
+        // extremely large generated headers (e.g. *_light_function_set.h)
+        // can hang indefinitely. These files rarely contain useful symbols
+        // for call-graph analysis.
+        if (source_len > 512 * 1024) {
+            cbm_log_info("parallel.extract.file.skip", "path", fi->rel_path,
+                         "reason", "file too large (>512KB) — skipped");
+            free_source(source);
+            ws->errors++;
+            continue;
+        }
+
+        install_extract_signal_handlers();
+        g_in_extract = 1;
+        CBMFileResult *result = NULL;
+        if (sigsetjmp(g_extract_jmp, 1) == 0) {
+            result = cbm_extract_file(source, source_len, fi->language, ec->project_name,
+                                      fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+        } else {
+            g_in_extract = 0;
+            cbm_log_info("parallel.extract.file.crash", "path", fi->rel_path,
+                         "reason", "SIGSEGV/SIGBUS — skipped");
+            free_source(source);
+            ws->errors++;
+            continue;
+        }
+        g_in_extract = 0;
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 

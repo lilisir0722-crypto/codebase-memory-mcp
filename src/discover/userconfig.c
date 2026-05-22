@@ -360,6 +360,51 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
 
     cfg->entries = entries;
     cfg->count = count;
+
+    /* ── Step 4: Load param_whitelist from project config ── */
+    if (repo_path && repo_path[0]) {
+        char project_path[PATH_BUF_SZ];
+        snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", repo_path);
+        FILE *pf = fopen(project_path, "rb");
+        if (pf) {
+            if (fseek(pf, 0, SEEK_END) == 0) {
+                long plen = ftell(pf);
+                (void)fseek(pf, 0, SEEK_SET);
+                if (plen > 0 && plen <= MAX_CONFIG_SIZE) {
+                    char *pbuf = malloc((size_t)plen + 1);
+                    if (pbuf) {
+                        size_t pread = fread(pbuf, 1, (size_t)plen, pf);
+                        pbuf[pread] = '\0';
+                        yyjson_doc *pdoc = yyjson_read(pbuf, pread, 0);
+                        if (pdoc) {
+                            yyjson_val *proot = yyjson_doc_get_root(pdoc);
+                            yyjson_val *wl = yyjson_obj_get(proot, "param_whitelist");
+                            if (yyjson_is_arr(wl)) {
+                                size_t wl_sz = yyjson_arr_size(wl);
+                                cfg->param_whitelist = calloc(wl_sz, sizeof(char *));
+                                if (cfg->param_whitelist) {
+                                    yyjson_val *item;
+                                    yyjson_arr_iter wl_iter;
+                                    yyjson_arr_iter_init(wl, &wl_iter);
+                                    while ((item = yyjson_arr_iter_next(&wl_iter)) != NULL) {
+                                        const char *s = yyjson_get_str(item);
+                                        if (s && s[0]) {
+                                            cfg->param_whitelist[cfg->param_whitelist_count++] =
+                                                strdup(s);
+                                        }
+                                    }
+                                }
+                            }
+                            yyjson_doc_free(pdoc);
+                        }
+                        free(pbuf);
+                    }
+                }
+            }
+            fclose(pf);
+        }
+    }
+
     return cfg;
 }
 
@@ -383,5 +428,9 @@ void cbm_userconfig_free(cbm_userconfig_t *cfg) {
         free(cfg->entries[i].ext);
     }
     free(cfg->entries);
+    for (int i = 0; i < cfg->param_whitelist_count; i++) {
+        free(cfg->param_whitelist[i]);
+    }
+    free(cfg->param_whitelist);
     free(cfg);
 }
