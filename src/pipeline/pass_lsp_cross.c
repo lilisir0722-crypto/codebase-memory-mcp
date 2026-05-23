@@ -12,16 +12,9 @@
  * Java today). Per-LSP emit functions dedup against entries already in
  * resolved_calls, so this pass is also idempotent — safe to invoke
  * multiple times if the pipeline gains a re-run path later.
- *
- * Parallelism: each file is processed independently (cache[i] is
- * per-file, gbuf / all_defs are read-only during the loop). The main
- * loop is dispatched via cbm_parallel_for. Counters are atomic.
- * A watchdog thread logs files that appear stuck (> 30 s) without
- * interrupting them.
  */
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
-#include "pipeline/worker_pool.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
@@ -30,23 +23,21 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
-#include "foundation/compat_thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
-#include <time.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
 enum {
-    PXC_MAX_FILE_BYTES_FACTOR = 100,
+    PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
     PXC_ITOA_BUF = 16,
-    PXC_WATCHDOG_INTERVAL_SEC = 10,
-    PXC_WATCHDOG_WARN_SEC = 30,
 };
 
+/* Format an int into a thread-local rotating buffer for log key=value emission.
+ * Mirrors the itoa_log helper in pass_calls.c — kept local so passes don't
+ * grow a foundation-wide formatting API just for log output. */
 static const char *itoa_buf(int val) {
     static _Thread_local char bufs[PXC_ITOA_BUF][PXC_ITOA_BUF];
     static _Thread_local int slot = 0;
@@ -56,81 +47,11 @@ static const char *itoa_buf(int val) {
     return out;
 }
 
-/* ── Watchdog ───────────────────────────────────────────────────── */
-
-#define PXC_MAX_WORKERS 64
-
-typedef struct {
-    _Atomic long    start_sec;   /* 0 = idle */
-    _Atomic int     file_idx;    /* current file index being processed */
-} pxc_worker_slot_t;
-
-typedef struct {
-    pxc_worker_slot_t   slots[PXC_MAX_WORKERS];
-    int                 nslots;
-    _Atomic int         done;          /* set to 1 to stop watchdog */
-    const cbm_file_info_t *files;
-    int                 file_count;
-    _Atomic int        *processed;
-} pxc_watchdog_ctx_t;
-
-static long pxc_now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec;
-}
-
-static _Thread_local int g_worker_slot = -1;
-static pxc_watchdog_ctx_t *g_watchdog_ctx = NULL;
-
-static void pxc_worker_begin(int file_idx) {
-    if (!g_watchdog_ctx || g_worker_slot < 0) return;
-    pxc_worker_slot_t *s = &g_watchdog_ctx->slots[g_worker_slot];
-    atomic_store_explicit(&s->file_idx, file_idx, memory_order_relaxed);
-    atomic_store_explicit(&s->start_sec, pxc_now_sec(), memory_order_release);
-}
-
-static void pxc_worker_end(void) {
-    if (!g_watchdog_ctx || g_worker_slot < 0) return;
-    pxc_worker_slot_t *s = &g_watchdog_ctx->slots[g_worker_slot];
-    atomic_store_explicit(&s->start_sec, 0, memory_order_release);
-}
-
-static void *pxc_watchdog_thread(void *arg) {
-    pxc_watchdog_ctx_t *ctx = (pxc_watchdog_ctx_t *)arg;
-    while (!atomic_load_explicit(&ctx->done, memory_order_relaxed)) {
-        struct timespec ts = {PXC_WATCHDOG_INTERVAL_SEC, 0};
-        nanosleep(&ts, NULL);
-
-        if (atomic_load_explicit(&ctx->done, memory_order_relaxed)) break;
-
-        long now = pxc_now_sec();
-        int total = atomic_load_explicit(ctx->processed, memory_order_relaxed);
-        cbm_log_info("pass.lsp_cross.progress",
-                     "processed", itoa_buf(total),
-                     "total", itoa_buf(ctx->file_count));
-
-        for (int i = 0; i < ctx->nslots; i++) {
-            pxc_worker_slot_t *s = &ctx->slots[i];
-            long start = atomic_load_explicit(&s->start_sec, memory_order_acquire);
-            if (start == 0) continue;
-            long elapsed = now - start;
-            if (elapsed >= PXC_WATCHDOG_WARN_SEC) {
-                int fi = atomic_load_explicit(&s->file_idx, memory_order_relaxed);
-                const char *path = (fi >= 0 && fi < ctx->file_count)
-                                    ? ctx->files[fi].rel_path : "?";
-                cbm_log_warn("pass.lsp_cross.slow",
-                             "worker", itoa_buf(i),
-                             "elapsed_sec", itoa_buf((int)elapsed),
-                             "path", path);
-            }
-        }
-    }
-    return NULL;
-}
-
 /* ── Local helpers ─────────────────────────────────────────────── */
 
+/* Slurp a file into a malloc'd, NUL-terminated buffer. Mirrors the
+ * read_file helper in pass_calls.c / pass_parallel.c (kept local so the
+ * pipeline doesn't grow a public read-file API just for this pass). */
 static char *pxc_read_file(const char *path, int *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -155,6 +76,9 @@ static char *pxc_read_file(const char *path, int *out_len) {
     return buf;
 }
 
+/* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP
+ * registrars only care about Class/Interface/Trait/Enum/Type/Protocol/
+ * Function/Method — variables, modules, decorators, etc. are skipped. */
 static const char *pxc_map_label(const char *label) {
     if (!label) return NULL;
     if (strcmp(label, "Class") == 0 ||
@@ -170,6 +94,8 @@ static const char *pxc_map_label(const char *label) {
     return NULL;
 }
 
+/* Build the embedded_types "|"-separated string from base_classes[].
+ * Returns NULL when there are no bases. Allocated in the supplied arena. */
 static const char *pxc_join_pipe(CBMArena *arena, const char *const *items) {
     if (!items || !items[0]) return NULL;
     int count = 0;
@@ -179,6 +105,7 @@ static const char *pxc_join_pipe(CBMArena *arena, const char *const *items) {
         total += strlen(items[i]);
     }
     if (count == 0) return NULL;
+    /* count - 1 separators + NUL. */
     size_t bufsz = total + (size_t)(count - 1) + 1;
     char *buf = (char *)cbm_arena_alloc(arena, bufsz);
     if (!buf) return NULL;
@@ -193,6 +120,9 @@ static const char *pxc_join_pipe(CBMArena *arena, const char *const *items) {
     return buf;
 }
 
+/* Convert one CBMDefinition into a CBMLSPDef. Returns 0 on success, -1
+ * to skip (unsupported label or missing required field). dst gets borrowed
+ * pointers into src and into `arena` for synthesised composites. */
 static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src,
                               const char *module_qn, CBMLSPDef *dst) {
     const char *label = pxc_map_label(src->label);
@@ -205,11 +135,17 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src,
     dst->def_module_qn = module_qn;
     dst->is_interface = (strcmp(label, "Interface") == 0 ||
                           strcmp(label, "Protocol") == 0);
+    /* Single return-type string. The per-language registrars split on '|'
+     * for multi-return languages (Go); single-return languages just see one
+     * piece, which is what's already stored. */
     dst->return_types = src->return_type;
     dst->embedded_types = pxc_join_pipe(arena, src->base_classes);
     return 0;
 }
 
+/* Collect a project-wide CBMLSPDef[] from all cached results. Returns a
+ * malloc'd array (caller frees) of length *out_count. String fields are
+ * borrowed from cache[i]->arena and from def_modules[i] (also borrowed). */
 static CBMLSPDef *pxc_collect_all_defs(CBMFileResult **cache,
                                        const cbm_file_info_t *files, int file_count,
                                        const char *project_name,
@@ -246,6 +182,10 @@ static CBMLSPDef *pxc_collect_all_defs(CBMFileResult **cache,
     return defs;
 }
 
+/* Build per-file import map (local_name -> resolved module QN) from gbuf
+ * IMPORTS edges. Mirrors build_import_map() in pass_parallel.c. Returns 0
+ * with *out_count = 0 when the file has no IMPORTS edges. Caller frees keys
+ * with pxc_free_import_map. */
 static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name,
                                  const char *rel_path, const char ***out_keys,
                                  const char ***out_vals, int *out_count) {
@@ -288,7 +228,7 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
         memcpy(local, start, n);
         local[n] = '\0';
         keys[count] = local;
-        vals[count] = target->qualified_name;
+        vals[count] = target->qualified_name; /* borrowed from gbuf */
         count++;
     }
     *out_keys = keys;
@@ -302,9 +242,10 @@ static void pxc_free_import_map(const char **keys, const char **vals, int count)
         for (int i = 0; i < count; i++) free((void *)keys[i]);
         free((void *)keys);
     }
-    free((void *)vals);
+    free((void *)vals); /* vals strings borrowed from gbuf — don't free elements */
 }
 
+/* Detect TS dialect flags from a relative path. */
 static void pxc_ts_modes(CBMLanguage lang, const char *rel_path,
                           bool *out_js, bool *out_jsx, bool *out_dts) {
     *out_js = (lang == CBM_LANG_JAVASCRIPT);
@@ -322,6 +263,7 @@ static void pxc_ts_modes(CBMLanguage lang, const char *rel_path,
     }
 }
 
+/* Returns true when this language has a cross-file LSP wired up. */
 static bool pxc_has_cross_lsp(CBMLanguage lang) {
     switch (lang) {
     case CBM_LANG_GO:
@@ -339,6 +281,9 @@ static bool pxc_has_cross_lsp(CBMLanguage lang) {
     }
 }
 
+/* True when (caller_qn, callee_qn) is already present in arr. Mirrors the
+ * intra-LSP dedup in py_emit_resolved_call / ts_emit_resolved_call so that
+ * cross-file entries duplicating per-file output get dropped at append. */
 static bool pxc_already_resolved(const CBMResolvedCallArray *arr,
                                   const char *caller_qn, const char *callee_qn) {
     if (!arr || !caller_qn || !callee_qn) return false;
@@ -353,6 +298,11 @@ static bool pxc_already_resolved(const CBMResolvedCallArray *arr,
     return false;
 }
 
+/* Append cross-file results from `src_out` (allocated in a scratch arena
+ * about to be destroyed) into `dst_calls` (lives in cache_entry->arena),
+ * copying every string field into dst_arena. Skips entries whose
+ * (caller_qn, callee_qn) is already in dst_calls — avoids inflating the
+ * array with cross-file duplicates of per-file LSP output. */
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                 const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out) return;
@@ -371,11 +321,18 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     }
 }
 
+/* Run cross-file LSP for a single file inside a scratch arena that gets
+ * freed when the call returns. The LSP would otherwise allocate a fresh
+ * type registry + stdlib + all project defs into the supplied arena, and
+ * that adds up to O(N×project_size) memory if we used cache[i]->arena
+ * directly across N files (test_incremental.c saw 3.5 GB peak on a
+ * 1100-file repo before this fix). Output gets copied into the file's own
+ * arena and merged into result->resolved_calls. */
 static void pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source,
                          int source_len, const char *module_qn,
                          CBMLSPDef *defs, int def_count,
                          const char **imp_names, const char **imp_qns, int imp_count) {
-    TSTree *tree = r->cached_tree;
+    TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
     cbm_arena_init(&scratch);
@@ -392,6 +349,10 @@ static void pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source,
     case CBM_LANG_CPP:
     case CBM_LANG_CUDA: {
         bool cpp_mode = (lang != CBM_LANG_C);
+        /* C/C++ cross LSP takes include_paths/include_ns_qns instead of
+         * imports — the existing pipeline doesn't carry C-style include
+         * resolution as a separate map, so pass NULL/0 and let the LSP
+         * fall back to its own #include scan. */
         cbm_run_c_lsp_cross(&scratch, source, source_len, module_qn, cpp_mode,
                              defs, def_count, NULL, NULL, 0, tree,
                              &out);
@@ -415,6 +376,8 @@ static void pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source,
     cbm_arena_destroy(&scratch);
 }
 
+/* Variant of pxc_run_one for TS/JS/JSX/TSX with explicit dialect flags.
+ * Same scratch-arena lifecycle as pxc_run_one. */
 static void pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len,
                             const char *module_qn,
                             CBMLSPDef *defs, int def_count,
@@ -434,101 +397,6 @@ static void pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len,
     cbm_arena_destroy(&scratch);
 }
 
-/* ── Parallel worker context ─────────────────────────────────────── */
-
-typedef struct {
-    /* read-only inputs */
-    const cbm_file_info_t  *files;
-    int                     file_count;
-    CBMFileResult         **cache;
-    CBMLSPDef              *all_defs;
-    int                     def_count;
-    const cbm_gbuf_t       *gbuf;
-    const char             *project_name;
-    char                  **def_modules; /* per-file, written once per slot */
-
-    /* atomic counters */
-    _Atomic int             processed;
-    _Atomic int             skipped_no_lsp;
-    _Atomic int             skipped_no_source;
-    _Atomic int             per_lang_calls;
-
-    /* watchdog */
-    pxc_watchdog_ctx_t     *watchdog;
-    _Atomic int             worker_slot_counter;
-} pxc_parallel_ctx_t;
-
-static void pxc_process_file(int i, void *vctx) {
-    pxc_parallel_ctx_t *ctx = (pxc_parallel_ctx_t *)vctx;
-
-    /* Assign a watchdog slot on first call from this thread */
-    if (g_worker_slot < 0) {
-        g_worker_slot = atomic_fetch_add_explicit(
-            &ctx->worker_slot_counter, 1, memory_order_relaxed);
-        if (g_worker_slot >= PXC_MAX_WORKERS) g_worker_slot = PXC_MAX_WORKERS - 1;
-    }
-
-    if (!ctx->cache[i]) return;
-    CBMLanguage lang = ctx->files[i].language;
-
-    if (!pxc_has_cross_lsp(lang)) {
-        atomic_fetch_add_explicit(&ctx->skipped_no_lsp, 1, memory_order_relaxed);
-        return;
-    }
-
-    int source_len = 0;
-    char *source = pxc_read_file(ctx->files[i].path, &source_len);
-    if (!source || source_len <= 0) {
-        free(source);
-        atomic_fetch_add_explicit(&ctx->skipped_no_source, 1, memory_order_relaxed);
-        return;
-    }
-
-    /* def_modules[i] written at most once per slot (no contention for same i) */
-    if (!ctx->def_modules[i]) {
-        ctx->def_modules[i] = cbm_pipeline_fqn_module(ctx->project_name,
-                                                       ctx->files[i].rel_path);
-    }
-
-    const char **imp_keys = NULL;
-    const char **imp_vals = NULL;
-    int imp_count = 0;
-    pxc_build_import_map(ctx->gbuf, ctx->project_name, ctx->files[i].rel_path,
-                          &imp_keys, &imp_vals, &imp_count);
-
-    pxc_worker_begin(i);
-
-    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
-        lang == CBM_LANG_TSX) {
-        bool js, jsx, dts;
-        pxc_ts_modes(lang, ctx->files[i].rel_path, &js, &jsx, &dts);
-        pxc_run_one_ts(ctx->cache[i], source, source_len, ctx->def_modules[i],
-                        ctx->all_defs, ctx->def_count,
-                        imp_keys, imp_vals, imp_count,
-                        js, jsx, dts);
-    } else {
-        pxc_run_one(lang, ctx->cache[i], source, source_len, ctx->def_modules[i],
-                     ctx->all_defs, ctx->def_count,
-                     imp_keys, imp_vals, imp_count);
-    }
-
-    pxc_worker_end();
-
-    pxc_free_import_map(imp_keys, imp_vals, imp_count);
-    free(source);
-
-    atomic_fetch_add_explicit(&ctx->per_lang_calls, 1, memory_order_relaxed);
-    int done = atomic_fetch_add_explicit(&ctx->processed, 1, memory_order_relaxed) + 1;
-
-    cbm_log_info("pass.lsp_cross.file.done",
-                 "pos", itoa_buf(i),
-                 "done", itoa_buf(done),
-                 "total", itoa_buf(ctx->file_count),
-                 "path", ctx->files[i].rel_path);
-}
-
-/* ── Public entry point ─────────────────────────────────────────── */
-
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx,
                                 const cbm_file_info_t *files,
                                 int file_count,
@@ -538,6 +406,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx,
     cbm_log_info("pass.start", "pass", "lsp_cross", "files",
                  itoa_buf(file_count));
 
+    /* Per-file module QN cache so we don't recompute it once per def + once
+     * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
     char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
     if (!def_modules) {
         cbm_log_error("pass.err", "pass", "lsp_cross", "phase", "alloc");
@@ -549,50 +419,64 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx,
                                                 ctx->project_name, def_modules,
                                                 &def_count);
 
-    /* Set up parallel context */
-    pxc_parallel_ctx_t pctx;
-    memset(&pctx, 0, sizeof(pctx));
-    pctx.files        = files;
-    pctx.file_count   = file_count;
-    pctx.cache        = cache;
-    pctx.all_defs     = all_defs;
-    pctx.def_count    = def_count;
-    pctx.gbuf         = ctx->gbuf;
-    pctx.project_name = ctx->project_name;
-    pctx.def_modules  = def_modules;
+    int processed = 0;
+    int skipped_no_lsp = 0;
+    int skipped_no_source = 0;
+    int per_lang_calls = 0;
 
-    /* Set up watchdog */
-    pxc_watchdog_ctx_t watchdog;
-    memset(&watchdog, 0, sizeof(watchdog));
-    watchdog.files      = files;
-    watchdog.file_count = file_count;
-    watchdog.processed  = &pctx.processed;
-    watchdog.nslots     = PXC_MAX_WORKERS;
-    pctx.watchdog       = &watchdog;
-    g_watchdog_ctx      = &watchdog;
+    for (int i = 0; i < file_count; i++) {
+        if (!cache[i]) continue;
+        CBMLanguage lang = files[i].language;
+        if (!pxc_has_cross_lsp(lang)) {
+            skipped_no_lsp++;
+            continue;
+        }
 
-    cbm_thread_t watchdog_thread;
-    int wd_started = cbm_thread_create(&watchdog_thread, 0,
-                                        pxc_watchdog_thread, &watchdog);
+        int source_len = 0;
+        char *source = pxc_read_file(files[i].path, &source_len);
+        if (!source || source_len <= 0) {
+            free(source);
+            skipped_no_source++;
+            continue;
+        }
 
-    /* Dispatch parallel */
-    cbm_parallel_for(file_count, pxc_process_file, &pctx,
-                     (cbm_parallel_for_opts_t){.max_workers = 0});
+        if (!def_modules[i]) {
+            def_modules[i] = cbm_pipeline_fqn_module(ctx->project_name, files[i].rel_path);
+        }
 
-    /* Stop watchdog */
-    atomic_store_explicit(&watchdog.done, 1, memory_order_relaxed);
-    if (wd_started == 0) cbm_thread_join(&watchdog_thread);
-    g_watchdog_ctx = NULL;
+        const char **imp_keys = NULL;
+        const char **imp_vals = NULL;
+        int imp_count = 0;
+        pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                              &imp_keys, &imp_vals, &imp_count);
+
+        if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+            lang == CBM_LANG_TSX) {
+            bool js, jsx, dts;
+            pxc_ts_modes(lang, files[i].rel_path, &js, &jsx, &dts);
+            pxc_run_one_ts(cache[i], source, source_len, def_modules[i],
+                            all_defs, def_count, imp_keys, imp_vals, imp_count,
+                            js, jsx, dts);
+        } else {
+            pxc_run_one(lang, cache[i], source, source_len, def_modules[i],
+                         all_defs, def_count, imp_keys, imp_vals, imp_count);
+        }
+        per_lang_calls++;
+        processed++;
+
+        pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        free(source);
+    }
 
     free(all_defs);
     for (int i = 0; i < file_count; i++) free(def_modules[i]);
     free(def_modules);
 
     cbm_log_info("pass.done", "pass", "lsp_cross",
-                 "files_processed",    itoa_buf(atomic_load(&pctx.processed)),
-                 "files_skipped_no_lsp",    itoa_buf(atomic_load(&pctx.skipped_no_lsp)),
-                 "files_skipped_no_source", itoa_buf(atomic_load(&pctx.skipped_no_source)),
-                 "defs_total",         itoa_buf(def_count),
-                 "lsp_calls",          itoa_buf(atomic_load(&pctx.per_lang_calls)));
+                 "files_processed", itoa_buf(processed),
+                 "files_skipped_no_lsp", itoa_buf(skipped_no_lsp),
+                 "files_skipped_no_source", itoa_buf(skipped_no_source),
+                 "defs_total", itoa_buf(def_count),
+                 "lsp_calls", itoa_buf(per_lang_calls));
     return 0;
 }
